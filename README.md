@@ -1,7 +1,7 @@
-📄 Chat with Your Document
+##📄 Chat with Your Document
 Welcome to Chat with Your Document, a Streamlit application that allows you to interact with your uploaded documents using Retrieval-Augmented Generation (RAG). Easily upload Word documents and ask questions to extract insights efficiently.
 
-🚀 Getting Started
+##🚀 Getting Started
 1️⃣ Start the Streamlit App
 Run the following command to launch the app:
 
@@ -17,13 +17,13 @@ By default, you can test the app by asking questions about the research topic:
 
 The app will extract relevant information, process it, and provide responses based on your queries.
 
-📌 Key Features
+##📌 Key Features
 ✅ Document Upload – Use Word documents to feed content for better insights.
 ✅ Smart Question Answering – Ask questions, and the app retrieves the most relevant information.
 ✅ Knowledge Accumulation – Builds a contextual understanding based on your uploaded documents.
 ✅ Research-Friendly – Ideal for analyzing research papers, reports, and detailed documents.
 
-🎯 Purpose
+##🎯 Purpose
 This tool is designed to help researchers, students, and professionals efficiently extract knowledge from documents without manually searching through pages of content.
 
 🛠 Built with:
