@@ -8,7 +8,7 @@ Welcome to **Chat with Your Document**, a **Streamlit** application that allows 
 Run the following command to launch the app:
 ```bash
 streamlit run app.py
-
+...
 ###2️⃣Upload Your Document
 Upload a Word document (.docx) to feed content into the chatbot.
 The model will use RAG (Retrieval-Augmented Generation) to retrieve relevant information from your document.
