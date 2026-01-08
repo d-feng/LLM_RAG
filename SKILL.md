@@ -9,12 +9,18 @@ Systematic framework for identifying and prioritizing optimal cancer indications
 
 ## Core Strategy
 
-Start with mechanism-driven hypotheses based on cytokine MOA, validate through biological data (TME profiling, immune archetypes, cell states, pathways), filter through clinical feasibility (checkpoint precedent, trial intelligence), and score commercial opportunity (addressable population, unmet need, competition).
+Start with mechanism-driven hypotheses based on cytokine MOA, validate through biological data (TME profiling, immune archetypes, cell states, pathways), filter through clinical feasibility (checkpoint precedent, trial intelligence), assess competitive landscape (patents, clinical programs, failures), and score commercial opportunity (addressable population, unmet need, competition).
 
 **Decision Formula:**
 ```
-Final Score = 0.40 × Biological + 0.35 × Clinical + 0.25 × Commercial
+Final Score = 0.30 × Biological + 0.25 × Clinical + 0.20 × Commercial + 0.25 × (1 - Competitive Risk)
 ```
+
+**Enhanced with Competitive Intelligence:**
+- Patent landscape analysis to identify freedom-to-operate and white space
+- Clinical program tracking to understand competitive positioning
+- Failure analysis to learn from others' setbacks
+- Success case studies to replicate winning strategies
 
 ## Quick Start Workflow
 
@@ -190,7 +196,93 @@ rwd_analysis = {
 - Flatiron (if available): Treatment patterns, rwPFS/rwOS
 - Literature: SOC efficacy benchmarks
 
-### Step 7: Integrated Scoring (Week 5)
+### Step 7: Competitive Intelligence (Week 5-6)
+
+**A. Patent Landscape Analysis**
+
+Search Google Patents or patent databases:
+
+```python
+# Query recent patents (2020-2025)
+search_terms = f"{cytokine_name} AND (cancer OR tumor) AND (engineered OR fusion)"
+
+for patent in search_results:
+    extract_data = {
+        'publication_number': patent.id,
+        'assignee': patent.owner,
+        'technology_class': classify_technology(patent),
+        'exemplified_indications': extract_indications(patent.examples),
+        'blocking_potential': assess_fto_risk(patent, your_format)
+    }
+```
+
+**Competitive patent metrics:**
+- Patent crowding score: Count of relevant patents per indication
+- FTO risk: Do broad claims block your format?
+- White space: Indications with fewer patents
+
+**B. Clinical Program Tracking**
+
+```python
+# Map active competitors
+programs = query_ct_gov(
+    intervention=cytokine_class,
+    condition=target_indications,
+    status=['Recruiting', 'Active']
+)
+
+competitive_matrix = {
+    'Phase 3': count([p for p in programs if p.phase == 'III']),
+    'Phase 2': count([p for p in programs if p.phase == 'II']),
+    'Recent failures': identify_terminated(programs, last_2_years=True)
+}
+```
+
+**C. Failure Analysis**
+
+Review major setbacks 2021-2025:
+- Bempegaldesleukin (PEG-IL-2): Failed Ph3 in melanoma, RCC, bladder
+- Nemvaleukin alfa: Stopped Ph3 in ovarian cancer (futility)
+- Efbalropendekin alfa: Discontinued Ph1
+
+**Extract lessons:**
+```python
+failure_lessons = {
+    'bempeg': 'PEGylation insufficient to solve Treg bias',
+    'nemvaleukin': 'Cold TME in late-line ovarian resistant to IL-2',
+    'efbalro': 'IL-15 format optimization critical for safety'
+}
+
+# Apply to your indication
+if your_indication == 'ovarian' and your_class == 'IL-2':
+    risk_flag = 'HIGH - similar to nemvaleukin failure'
+```
+
+**D. Competitive Risk Scoring**
+
+```python
+competitive_risk = (
+    0.25 * patent_crowding_score +
+    0.35 * clinical_competition_score +
+    0.25 * regulatory_bar_score +
+    0.15 * recent_failure_penalty
+)
+
+# Interpretation:
+# <0.3: Low competition (opportunity)
+# 0.3-0.6: Moderate (need differentiation)
+# >0.6: High (risky, avoid unless clearly superior)
+```
+
+**Key outputs:**
+- Patent landscape map (technology clusters, assignees, trends)
+- Competitive clinical matrix (active programs by phase)
+- Failure lessons learned (avoid repeat mistakes)
+- Competitive risk score per indication
+
+**Reference:** See `references/competitive-intelligence.md` for detailed workflows
+
+### Step 8: Integrated Scoring (Week 7)
 
 **A. Biological Plausibility (0-1.0, weight 40%)**
 
@@ -225,15 +317,32 @@ comm_score = (
 )
 ```
 
-**D. Final Composite**
+**D. Competitive Opportunity (0-1.0, weight 25%)**
 
 ```python
-final_score = 0.40 * bio + 0.35 * clin + 0.25 * comm
+competitive_risk = (
+    0.25 * patent_crowding +           # IP freedom
+    0.35 * clinical_competition +      # Active programs
+    0.25 * regulatory_bar +            # Approval difficulty
+    0.15 * recent_failure_penalty      # Similar failures
+)
+
+competitive_advantage = 1 - competitive_risk  # Invert for scoring
+```
+
+**E. Final Composite**
+
+```python
+final_score = (
+    0.30 * bio + 
+    0.25 * clin + 
+    0.20 * comm + 
+    0.25 * competitive_advantage
+)
 
 # Apply risk adjustments
 if terminal_exhaustion_high: final_score *= 0.85
 if pathway_deficient: final_score *= 0.75
-if super_competitive: final_score *= 0.90
 ```
 
 **Decision Thresholds:**
@@ -370,6 +479,13 @@ For top 3-5 indications, create comprehensive profiles:
 - **ClinicalTrials.gov:** https://clinicaltrials.gov/api (trial data)
 - **SEER:** https://seer.cancer.gov (epidemiology)
 
+**Competitive Intelligence:**
+- **Google Patents:** https://patents.google.com (patent landscape)
+- **PatentScope (WIPO):** https://patentscope.wipo.int (international patents)
+- **FierceBiotech:** https://www.fiercebiotech.com (industry news, deals)
+- **Endpoints News:** https://endpts.com (clinical trial results, failures)
+- **FDA Approvals:** https://www.fda.gov/drugs (regulatory decisions)
+
 **Analysis Tools:**
 - Immune deconvolution: CIBERSORT, xCell, TIMER
 - Pathway scoring: ssGSEA (GSVA package in R)
@@ -466,6 +582,12 @@ stable_leads = indications_in_top3_all_scenarios()
 - Misjudging competition intensity
 - Unrealistic market share assumptions
 
+**Competitive Intelligence:**
+- Ignoring patent landscape (late-stage FTO issues costly)
+- Not learning from competitors' failures (repeat mistakes)
+- Underestimating regulatory bar set by recent approvals
+- Missing white space opportunities (underexplored combinations/indications)
+
 ## Go/No-Go Criteria
 
 **Minimum Thresholds (Must Meet ALL):**
@@ -486,16 +608,22 @@ When completing indication selection analysis, provide:
 
 1. **Executive Summary Table:**
 ```
-Rank  Indication    Bio   Clin  Comm  Final  Recommendation
-1     Melanoma     0.85  0.72  0.68  0.76   Lead
-2     RCC          0.78  0.80  0.55  0.72   Backup #1
-3     MSI-H        0.82  0.65  0.60  0.71   Backup #2
+Rank  Indication    Bio   Clin  Comm  Comp  Final  Recommendation
+1     Melanoma     0.85  0.72  0.68  0.60  0.72   Lead
+2     RCC          0.78  0.80  0.55  0.70  0.71   Backup #1
+3     MSI-H        0.82  0.65  0.60  0.55  0.67   Backup #2
 ```
 
 2. **Top 3 Evidence Packages:** Full profiles per template above
 
-3. **Development Roadmap:** Phase 1b/2 design for lead indication
+3. **Competitive Landscape Summary:**
+   - Active programs per indication
+   - Patent landscape assessment
+   - Key recent failures and lessons
+   - Differentiation strategy
 
-4. **Risk Registry:** Key risks with mitigation strategies
+4. **Development Roadmap:** Phase 1b/2 design for lead indication
 
-5. **Data Gaps:** Missing analyses that would refine decision
+5. **Risk Registry:** Key risks with mitigation strategies
+
+6. **Data Gaps:** Missing analyses that would refine decision
