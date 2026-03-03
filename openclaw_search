@@ -1,0 +1,682 @@
+# Hybrid Search Strategy & Guideline
+*Derived from OpenClaw `src/memory/` codebase — deep-dive into hybrid.ts, mmr.ts, temporal-decay.ts, query-expansion.ts, manager-search.ts, search-manager.ts*
+*Date: 2026-03-03*
+
+---
+
+## 1. What Is Hybrid Search and Why It Matters
+
+Hybrid search is the combination of two complementary retrieval signals — **vector (semantic) similarity** and **BM25 keyword (full-text) relevance** — into a single, ranked result list. Neither signal alone is sufficient for a robust personal AI memory system.
+
+| Signal | Strength | Weakness |
+|--------|----------|----------|
+| **Vector / semantic** | Finds conceptually similar text even when the exact words differ ("Mac Studio gateway host" ≈ "the machine running the gateway") | Weak for exact, high-signal tokens: IDs, error strings, code symbols, version numbers |
+| **BM25 / keyword** | Strong at exact token recall: `a828e60`, `memorySearch.query.hybrid`, `sqlite-vec unavailable` | Fails on paraphrases and synonyms; sensitive to wording |
+| **Hybrid (both)** | Covers both classes of queries | More complex to implement and tune; requires normalization to merge scores fairly |
+
+The OpenClaw codebase solves this with a clean pipeline: independent retrieval from each store → weighted score merge → optional temporal decay → optional MMR re-ranking → top-K results.
+
+---
+
+## 2. Architecture Overview
+
+```
+User Query
+    │
+    ├──► FTS Query Builder ──► SQLite FTS5 (BM25)
+    │                               │ BM25 rank
+    │                               ▼
+    │                         bm25RankToScore()    ← textScore ∈ (0, 1]
+    │
+    ├──► Embedding Provider ─► sqlite-vec / JS cosine
+    │                               │ cosine similarity
+    │                               ▼
+    │                         vectorScore ∈ [0, 1]
+    │
+    ▼
+mergeHybridResults()
+    │   Union by chunk ID
+    │   finalScore = vectorWeight × vectorScore + textWeight × textScore
+    │
+    ▼
+applyTemporalDecayToHybridResults()   (async, reads file timestamps)
+    │   decayedScore = score × e^(-λ × ageInDays)
+    │   λ = ln(2) / halfLifeDays
+    │   Evergreen files (MEMORY.md, non-dated memory/*.md) → skip decay
+    │
+    ▼
+Sort by score DESC
+    │
+    ▼
+applyMMRToHybridResults()              (optional, sync)
+    │   Iterative: pick result that maximizes
+    │   λ_mmr × normalizedRelevance − (1−λ_mmr) × maxJaccardSimilarityToSelected
+    │
+    ▼
+Top-K Results
+```
+
+**Key design decision:** Temporal decay runs *before* the final sort; MMR runs *after*. This ensures:
+- Decayed scores are what get sorted and normalized in MMR.
+- MMR diversity operates on the final relevance ordering, not the pre-decay order.
+
+---
+
+## 3. Building the FTS Query
+
+**Source file:** `src/memory/hybrid.ts → buildFtsQuery()`
+
+The raw user query is tokenized and each token is individually quoted and AND-joined for SQLite FTS5 MATCH:
+
+```
+"hello world"   →  "hello" AND "world"
+"FOO_bar baz-1" →  "FOO_bar" AND "baz" AND "1"
+"金银价格"       →  "金银价格"      ← CJK block, keep as unit
+"価格 2026年"   →  "価格" AND "2026年"
+"   "           →  null             ← empty query, skip FTS entirely
+```
+
+**Tokenizer rule:** Extract Unicode letter/number/underscore sequences (`[\p{L}\p{N}_]+`). Each token is double-quoted (with internal quotes stripped) so FTS5 treats them as phrase tokens, not operators.
+
+**Why AND-join?** Every token must appear in the result, preventing false positives from partial matches. If you need broader recall (OR), use `expandQueryForFts()` (Section 6).
+
+**Score conversion:**
+
+```typescript
+bm25RankToScore(rank: number): number {
+  const normalized = isFinite(rank) ? Math.max(0, rank) : 999;
+  return 1 / (1 + normalized);
+}
+```
+
+BM25 rank from SQLite FTS5 is negative (lower = better relevance, e.g., -5.2). After `Math.max(0, rank)` clamps it to non-negative, the inverse formula maps it to a [0, 1] score where 0 rank → score = 1.0 (perfect match) and higher rank → score approaches 0.
+
+**FTS search SQL template:**
+
+```sql
+SELECT id, path, source, start_line, end_line, text,
+       bm25(chunks_fts) AS rank
+  FROM chunks_fts
+ WHERE chunks_fts MATCH ?          -- the AND-joined FTS5 query
+   AND model = ?                   -- optional: pin to current embedding model
+   AND source IN (?, ...)          -- optional: filter by source type
+ ORDER BY rank ASC                 -- ASC = best BM25 match first
+ LIMIT ?
+```
+
+**Guideline:** When using FTS-only mode (no embedding provider available), set `providerModel = undefined` to search across all model fingerprints so previously indexed chunks are still reachable.
+
+---
+
+## 4. Vector Search
+
+**Source file:** `src/memory/manager-search.ts → searchVector()`
+
+Two execution paths, chosen based on whether the `sqlite-vec` extension loaded successfully:
+
+### Path A: sqlite-vec (preferred)
+
+```sql
+SELECT c.id, c.path, c.start_line, c.end_line, c.text,
+       c.source,
+       vec_distance_cosine(v.embedding, ?) AS dist
+  FROM vec_chunks v
+  JOIN chunks c ON c.id = v.id
+ WHERE c.model = ?
+   AND c.source IN (?, ...)
+ ORDER BY dist ASC
+ LIMIT ?
+```
+
+The query vector is serialized as a `Float32Array` binary blob. `vec_distance_cosine` returns a distance in `[0, 2]` for unit vectors. Score = `1 - dist`.
+
+### Path B: JS cosine fallback (when sqlite-vec unavailable)
+
+Load all chunks into memory, compute cosine similarity in JavaScript for every chunk, sort, slice to limit. This is O(n) per query and acceptable for small-to-medium corpora (< ~50k chunks). For larger corpora, the sqlite-vec extension is essential.
+
+```typescript
+cosineSimilarity(queryVec, chunkEmbedding):
+  dot product / (||queryVec|| × ||chunkEmbedding||)
+```
+
+**Snippet safety:** All snippets are truncated using `truncateUtf16Safe(text, maxChars)` to prevent multi-byte UTF-16 character splits that would produce corrupted strings.
+
+---
+
+## 5. Score Merging
+
+**Source file:** `src/memory/hybrid.ts → mergeHybridResults()`
+
+### Union merge (not intersection)
+
+The merge uses chunk ID as the union key. A chunk in only the vector pool gets `textScore = 0`; a chunk in only the keyword pool gets `vectorScore = 0`. This ensures no result from either retriever is lost.
+
+```typescript
+// Pseudocode of the merge
+const byId = new Map<string, {vectorScore, textScore, ...}>();
+
+for r of vectorResults:
+  byId.set(r.id, { ...r, textScore: 0 })
+
+for r of keywordResults:
+  if byId.has(r.id):
+    existing.textScore = r.textScore
+    if r.snippet: existing.snippet = r.snippet   // keyword snippet preferred
+  else:
+    byId.set(r.id, { ...r, vectorScore: 0 })
+
+for entry of byId.values():
+  entry.score = vectorWeight * entry.vectorScore + textWeight * entry.textScore
+```
+
+**Snippet preference rule:** When a chunk appears in both pools, the **keyword snippet is preferred** over the vector snippet. Rationale: the BM25 match is more likely to contain the exact token the user queried, making the keyword snippet more informative as a preview.
+
+### Weight configuration
+
+```
+finalScore = vectorWeight × vectorScore + textWeight × textScore
+```
+
+Weights should be normalized so they sum to 1.0. Defaults and recommendations:
+
+| Use case | vectorWeight | textWeight | Reasoning |
+|----------|-------------|-----------|-----------|
+| General conversation recall | 0.7 | 0.3 | Semantic intent dominates |
+| Code / technical symbols | 0.4 | 0.6 | Exact tokens matter more |
+| Mixed (recommended default) | 0.7 | 0.3 | Safe general-purpose setting |
+| FTS-only fallback | 0.0 | 1.0 | No embeddings available |
+
+**Candidate pool sizing:** Use `candidateMultiplier × maxResults` for each pool before merging. Default multiplier: 4. A larger multiplier improves recall at the cost of more processing in temporal decay and MMR.
+
+---
+
+## 6. Query Expansion
+
+**Source file:** `src/memory/query-expansion.ts`
+
+Query expansion is used specifically in **FTS-only mode** (no embedding provider available). Conversational queries like "that thing we discussed yesterday" or "之前讨论的那个方案" produce very few FTS5 matches with the strict AND-join approach. Expansion extracts meaningful keywords for OR-matching alongside the original query.
+
+### Multilingual stop word filtering
+
+The codebase includes stop word sets for 7 languages: English, Spanish, Portuguese, Arabic, Korean, Japanese, and Chinese. Tokens matching any stop word set are dropped before building the expanded query.
+
+Beyond generic stop words, the lists include **vague time references** that should never be used as FTS tokens:
+
+```
+yesterday / today / tomorrow / earlier / recently / ago  (EN)
+ayer / hoy / mañana / antes / recientemente             (ES)
+昨天 / 今天 / 明天 / 最近                              (ZH)
+어제 / 오늘 / 내일 / 최근                              (KO)
+```
+
+These time references are useful for *semantic* queries (vector search) but produce irrelevant FTS matches.
+
+### Language-specific tokenization
+
+**CJK (Chinese / Japanese):** No word boundaries exist. The tokenizer extracts:
+- Chinese: character unigrams + bigrams (e.g., "方案" → ["方", "案", "方案"])
+- Japanese: script-segmented (kanji blocks → unigrams + bigrams; katakana runs → kept whole; ASCII runs → kept whole)
+
+**Korean:** Strip trailing particles using longest-match: "API를" → ["API를", "API"]. Both forms are emitted for maximum coverage. Particle-stripped stems must be ≥ 2 Korean syllables to be useful.
+
+### Keyword validity rules
+
+```
+Reject if:
+  - empty string
+  - pure ASCII alpha, length < 3 (too short, likely stopword fragment)
+  - all digits (e.g. "2026" on its own — rarely useful)
+  - all punctuation/symbol characters
+```
+
+### Expanded query format
+
+```typescript
+expandQueryForFts("what was the solution for the API bug") →
+{
+  original: "what was the solution for the API bug",
+  keywords: ["solution", "API", "bug"],
+  expanded: "what was the solution for the API bug OR solution OR API OR bug"
+}
+```
+
+The original query is always included first for FTS5 MATCH precedence; keywords are OR-appended to broaden recall.
+
+### LLM-assisted expansion (optional)
+
+The `expandQueryWithLlm(query, llmExpander?)` function accepts an optional LLM callback. If provided, it tries the LLM first and falls back to local extraction on failure:
+
+```typescript
+type LlmQueryExpander = (query: string) => Promise<string[]>;
+
+async expandQueryWithLlm(query, llmExpander?) {
+  if (llmExpander) {
+    try {
+      const llmKeywords = await llmExpander(query);
+      if (llmKeywords.length > 0) return llmKeywords;
+    } catch { /* fall through */ }
+  }
+  return extractKeywords(query);   // local extraction
+}
+```
+
+**Guideline:** Only use LLM expansion when latency is acceptable and the query corpus is large enough to justify it. For interactive memory search with a 4-second timeout, local expansion is safer.
+
+---
+
+## 7. Temporal Decay
+
+**Source file:** `src/memory/temporal-decay.ts`
+
+### The decay formula
+
+```
+decayedScore = score × e^(-λ × ageInDays)
+where λ = ln(2) / halfLifeDays
+```
+
+This is an exponential half-life decay. With `halfLifeDays = 30`:
+
+| Age | Multiplier | Example |
+|-----|-----------|---------|
+| 0 days (today) | 1.000 | Full score retained |
+| 7 days | 0.857 | ~14% reduction |
+| 30 days | 0.500 | Half score |
+| 90 days | 0.125 | 7/8 reduction |
+| 180 days | 0.016 | Nearly gone |
+
+### Timestamp extraction strategy
+
+The code tries sources in priority order:
+
+1. **Parse from file path:** `/memory/YYYY-MM-DD.md` matched with regex `(?:^|\/)memory\/(\d{4})-(\d{2})-(\d{2})\.md$`. Parsed as UTC to avoid timezone drift.
+2. **Evergreen guard:** If source is `"memory"` and path matches evergreen pattern → return `null` (no decay). Evergreen = `MEMORY.md`, `memory.md`, or non-dated files in `memory/` (e.g., `memory/projects.md`).
+3. **File mtime:** `fs.stat(absolutePath).mtimeMs` as fallback for non-memory sources (e.g., session transcripts).
+4. **No timestamp found:** Skip decay, return original score.
+
+### Timestamp promise cache
+
+The implementation caches timestamp resolution per `source:path` key to avoid redundant `fs.stat` calls when multiple chunks come from the same file:
+
+```typescript
+const timestampPromiseCache = new Map<string, Promise<Date | null>>();
+// One stat per file, regardless of how many chunks belong to it
+```
+
+### When to configure temporal decay
+
+| Scenario | Recommendation |
+|----------|---------------|
+| Agent has < 30 days of memory | Skip — not enough data to benefit |
+| Agent has months of daily notes | Enable — stale notes outrank recent ones |
+| Using MEMORY.md for curated facts | Always safe — evergreen files are never decayed |
+| Large external document corpus | Use file mtime; increase halfLifeDays to 90+ |
+| Archival / historical research use | Disable — older notes should rank normally |
+
+---
+
+## 8. MMR Re-ranking
+
+**Source file:** `src/memory/mmr.ts`
+**Reference:** Carbonell & Goldstein, "The Use of MMR, Diversity-Based Reranking" (1998)
+
+### The MMR formula
+
+```
+MMR(candidate) = λ × relevance(candidate) − (1−λ) × max_similarity(candidate, selected)
+```
+
+Iteratively select the candidate that maximizes this score. The `λ` parameter controls the diversity-relevance trade-off:
+
+| λ value | Behavior |
+|---------|----------|
+| 1.0 | Pure relevance — identical to sorting by score |
+| 0.7 | Default — slight relevance bias with diversity |
+| 0.5 | Equal weight for relevance and diversity |
+| 0.0 | Maximum diversity — ignores relevance entirely |
+
+### Score normalization (critical implementation detail)
+
+Before computing MMR scores, the original relevance scores are min-max normalized to [0, 1]:
+
+```typescript
+normalizedRelevance = (score - minScore) / (maxScore - minScore)
+// Edge case: if all scores are equal → normalizedRelevance = 1
+```
+
+This normalization is essential because Jaccard similarity is naturally in [0, 1], and without normalizing relevance to the same range, one term would dominate the formula regardless of λ.
+
+### Similarity measure: Jaccard on tokenized content
+
+```typescript
+tokenize(text): Set<string> {
+  // Extract alphanumeric tokens, lowercase
+  return new Set(text.toLowerCase().match(/[a-z0-9_]+/g) ?? []);
+}
+
+jaccardSimilarity(setA, setB): number {
+  intersection / union
+  // Edge: both empty → 1.0; one empty → 0.0
+}
+```
+
+**Why Jaccard instead of cosine on embedding vectors?** The MMR step runs on the already-retrieved results (typically 6-20 items). Re-embedding those snippets purely for diversity measurement would add latency and API cost. Jaccard on tokenized snippet text is fast, offline, and good enough for de-duplicating near-identical daily note snippets.
+
+### Token cache for efficiency
+
+All items are pre-tokenized once before the iterative selection loop, using a `Map<id, Set<string>>`. The inner loop has O(k) token lookups where k is the number of already-selected items.
+
+### Tiebreaker
+
+When two candidates have the same MMR score, the one with the higher **original relevance score** wins. This ensures consistent, deterministic output.
+
+### Early exits
+
+```
+items.length ≤ 1  →  return as-is
+λ = 1.0           →  return sorted by relevance (skip MMR computation)
+λ ≤ 0 or ≥ 1     →  clamped to [0, 1]
+```
+
+### How MMR adapts to hybrid search results
+
+`applyMMRToHybridResults()` creates synthetic IDs as `"path:startLine:index"` to handle chunks that might share a path+startLine from different sources, then maps the re-ranked MMR items back to the original typed result objects.
+
+---
+
+## 9. Fallback Chain
+
+**Source file:** `src/memory/search-manager.ts → FallbackMemoryManager`
+
+The FallbackMemoryManager wraps a QMD primary and a builtin-SQLite factory. It implements the `MemorySearchManager` interface so callers are unaware of which backend is active.
+
+### State machine
+
+```
+Initial state: primaryActive = true
+    │
+    ├── search() called
+    │     ├── if primaryActive:  try QMD
+    │     │     ├── success → return results
+    │     │     └── failure → set primaryActive = false
+    │     │                   evict from QMD_MANAGER_CACHE
+    │     │                   log warning
+    │     └── if !primaryActive: ensure fallback, call fallback.search()
+    │
+    └── On close(): close both primary and fallback, evict cache entry
+```
+
+### Cache eviction on failure
+
+When QMD fails for the first time in a session, the manager evicts itself from `QMD_MANAGER_CACHE` (keyed by `agentId:JSON.stringify(qmdConfig)`). This means the **next** session will retry QMD with a fresh manager, allowing recovery from transient QMD failures (e.g., binary not found at startup, but installed by the user shortly after).
+
+### What triggers fallback vs. hard failure
+
+| Condition | Behavior |
+|-----------|----------|
+| QMD binary missing | Falls back to builtin immediately |
+| QMD subprocess crashes | Falls back, evicts cache for next retry |
+| QMD timeout | Falls back (timeout is per-search, not global) |
+| sqlite-vec extension missing | Builtin uses JS cosine instead (no fallback needed, soft degradation) |
+| FTS5 unavailable | Builtin runs vector-only (soft degradation) |
+| Embeddings fail | Builtin attempts BM25-only if FTS is available |
+| Both QMD and builtin fail | Throws with last known error message |
+
+**Critical guideline:** Never throw from a memory search fallback path. Return an empty result set with a logged warning rather than crashing the agent turn.
+
+---
+
+## 10. QMD Sidecar Integration
+
+**Source file:** `src/memory/backend-config.ts`
+
+QMD is a local-first search sidecar that combines BM25 + vector + learned reranking via a standalone CLI binary. The codebase configures it through `ResolvedQmdConfig`.
+
+### Three search modes
+
+| Mode | Command | Speed | Quality | When to use |
+|------|---------|-------|---------|-------------|
+| `search` | `qmd search --json` | Fast | Good | Default for interactive use |
+| `vsearch` | `qmd vsearch --json` | Fast | Vector-only | When keywords add noise |
+| `query` | `qmd query --json` | Slow (CPU-bound) | Best | Batch/offline use, best recall |
+
+**Warning from the code comments:** `query` mode triggers query expansion + neural reranking, which can be "extremely slow on CPU-only systems." Default is `search` for this reason.
+
+### Collection layout
+
+QMD collections map to filesystem paths with glob patterns:
+
+```typescript
+// Auto-generated default collections:
+{ name: "memory-root-{agentId}", path: workspaceDir, pattern: "MEMORY.md" }
+{ name: "memory-alt-{agentId}",  path: workspaceDir, pattern: "memory.md" }
+{ name: "memory-dir-{agentId}",  path: memory/, pattern: "**/*.md" }
+
+// User-defined custom collections:
+{ name: "docs-{agentId}",        path: ~/notes/, pattern: "**/*.md" }
+```
+
+Collection names are sanitized (lowercase, hyphens only) and deduplicated with numeric suffixes. Scoping by agent ID prevents cross-agent index contamination when multiple agents share the same QMD instance.
+
+### Update cadence
+
+```
+Boot:     qmd update + qmd embed (background by default; waitForBootSync = true to block)
+Interval: qmd update every 5 minutes (configurable)
+Embed:    qmd embed every 60 minutes (separate from update; expensive)
+Debounce: 15 seconds after file change before triggering update
+```
+
+**Guideline:** Keep `waitForBootSync = false` in production to avoid blocking chat startup. Accept slightly stale results for the first few seconds.
+
+### Scope: preventing memory leak to group chats
+
+Default QMD scope: deny all, allow only direct chats.
+
+```json5
+scope: {
+  default: "deny",
+  rules: [{ action: "allow", match: { chatType: "direct" } }]
+}
+```
+
+This prevents personal memories from being injected into group channel conversations. Always scope memory recall to private/DM contexts unless you explicitly intend group recall.
+
+---
+
+## 11. The MemorySearchManager Interface
+
+**Source file:** `src/memory/types.ts`
+
+All backends (builtin SQLite, QMD, LanceDB plugin) implement this interface, enabling transparent backend swapping:
+
+```typescript
+interface MemorySearchManager {
+  search(query, opts?): Promise<MemorySearchResult[]>
+  readFile(params):     Promise<{ text: string; path: string }>
+  status():             MemoryProviderStatus
+  sync?(params?):       Promise<void>            // optional
+  probeEmbeddingAvailability(): Promise<{ ok, error? }>
+  probeVectorAvailability():    Promise<boolean>
+  close?():             Promise<void>             // optional
+}
+```
+
+The two probe methods are used by diagnostics (`openclaw doctor`) to verify that embeddings and vector acceleration are correctly configured without running a full search.
+
+**Guideline for implementing a custom backend:** Implement `search` and `readFile` as the minimum viable set. The `sync`, `status`, and `close` methods are important for production but optional for prototyping.
+
+---
+
+## 12. Implementation Checklist
+
+Use this checklist when building hybrid search for a new project:
+
+### FTS Layer
+- [ ] Set up SQLite FTS5 virtual table (`CREATE VIRTUAL TABLE ... USING fts5(...)`)
+- [ ] Use `buildFtsQuery()` pattern: AND-join quoted tokens, Unicode-aware tokenizer (`[\p{L}\p{N}_]+`)
+- [ ] Convert BM25 rank to normalized score: `1 / (1 + max(0, rank))`
+- [ ] Handle FTS-only mode: search all model fingerprints when embedding provider is absent
+- [ ] Truncate snippets safely (UTF-16 aware) before storing in results
+
+### Vector Layer
+- [ ] Prefer `sqlite-vec` extension for in-database cosine distance (`vec_distance_cosine`)
+- [ ] Implement JS cosine similarity fallback for when the extension is unavailable
+- [ ] Store query vector as `Float32Array` binary blob
+- [ ] Convert distance to similarity: `score = 1 - cosineDistance`
+- [ ] Pin results to current embedding model fingerprint (model name + endpoint)
+
+### Merge Layer
+- [ ] Union by chunk ID, not by path (multiple chunks per file)
+- [ ] Default weights: vectorWeight = 0.7, textWeight = 0.3 (sum must equal 1.0)
+- [ ] Prefer keyword snippet over vector snippet when same chunk appears in both pools
+- [ ] Fetch `candidateMultiplier × maxResults` from each pool before merge (default: 4×)
+
+### Temporal Decay
+- [ ] Parse date from `memory/YYYY-MM-DD.md` path pattern (UTC, not local time)
+- [ ] Detect evergreen files (MEMORY.md, non-dated memory/*.md) → skip decay
+- [ ] Fall back to file mtime for non-memory sources
+- [ ] Cache timestamp resolution per file to avoid redundant fs.stat calls
+- [ ] Default halfLifeDays = 30; adjust for your data retention window
+
+### MMR Re-ranking
+- [ ] Normalize scores to [0, 1] using min-max before MMR computation
+- [ ] Use Jaccard similarity on tokenized snippet text (not re-embedding)
+- [ ] Pre-tokenize all candidates once before the iterative selection loop
+- [ ] Default λ = 0.7; document how to tune toward diversity (↓λ) or relevance (↑λ)
+- [ ] Provide a tiebreaker (original score) for equal MMR scores
+
+### Query Expansion
+- [ ] Apply stop word filtering for each language in your corpus
+- [ ] Handle CJK: character n-grams (unigrams + bigrams for Chinese/Japanese)
+- [ ] Handle Korean: strip trailing particles, emit both forms
+- [ ] Drop vague time references as FTS tokens (yesterday, today, etc.)
+- [ ] Format: `original OR keyword1 OR keyword2` for broader recall
+- [ ] Provide an optional LLM expander with local extraction fallback
+
+### Fallback & Reliability
+- [ ] Implement `FallbackMemoryManager` pattern: primary → fallback on first failure
+- [ ] Evict the primary from cache on failure so next session retries fresh
+- [ ] Never throw from the fallback path — return empty results + log warning
+- [ ] Degrade gracefully: QMD → SQLite hybrid → FTS-only → empty
+- [ ] Default scope: deny memory recall in group/public channels
+
+---
+
+## 13. Tuning Guide
+
+### Finding the right vector/text weight split
+
+Start with `0.7 / 0.3`. If you observe:
+- **High recall for natural language but missing exact IDs/symbols** → increase textWeight toward 0.4–0.5
+- **Good keyword recall but missing paraphrased content** → increase vectorWeight toward 0.8
+- **FTS matching completely irrelevant documents** → tighten the FTS query (AND instead of OR), or lower candidateMultiplier for the keyword pool
+
+### Choosing halfLifeDays for temporal decay
+
+| Agent type | Recommended halfLifeDays |
+|-----------|--------------------------|
+| Daily personal assistant | 30 days |
+| Long-range project tracking | 60–90 days |
+| Archival / research | Disable or 365+ |
+| High-churn operational context | 7–14 days |
+
+### When to enable MMR
+
+Enable MMR when you observe:
+- Top-3 results from `memory_search` are near-identical daily note snippets
+- Result list feels redundant despite using hybrid scoring
+- Users complain "you always show me the same thing"
+
+Tune λ down (toward 0.5) if diversity is insufficient; up (toward 0.9) if results feel scattered.
+
+### QMD search mode selection
+
+| Priority | Use |
+|----------|-----|
+| Latency < 500ms | `search` (default) |
+| Best vector recall | `vsearch` |
+| Best overall quality, latency acceptable | `query` (only with a fast CPU/GPU) |
+
+---
+
+## 14. Default Configuration Reference
+
+```json5
+// Built-in SQLite backend with full hybrid search
+memorySearch: {
+  provider: "openai",
+  model: "text-embedding-3-small",
+  fallback: "local",
+
+  store: {
+    vector: { enabled: true }   // use sqlite-vec if available
+  },
+
+  cache: {
+    enabled: true,
+    maxEntries: 50000
+  },
+
+  query: {
+    hybrid: {
+      enabled: true,
+      vectorWeight: 0.7,
+      textWeight: 0.3,
+      candidateMultiplier: 4,
+
+      mmr: {
+        enabled: false,         // opt-in; enable if duplicates are common
+        lambda: 0.7
+      },
+
+      temporalDecay: {
+        enabled: false,         // opt-in; enable after ~30 days of daily notes
+        halfLifeDays: 30
+      }
+    }
+  }
+}
+
+// QMD sidecar backend (optional, best recall)
+memory: {
+  backend: "qmd",
+  citations: "auto",
+  qmd: {
+    searchMode: "search",       // "query" for best quality, slower
+    includeDefaultMemory: true,
+    update: {
+      interval: "5m",
+      debounceMs: 15000,
+      waitForBootSync: false    // don't block session start
+    },
+    limits: {
+      maxResults: 6,
+      maxSnippetChars: 700,
+      maxInjectedChars: 4000,
+      timeoutMs: 4000
+    },
+    scope: {
+      default: "deny",
+      rules: [{ action: "allow", match: { chatType: "direct" } }]
+    }
+  }
+}
+```
+
+---
+
+## 15. Source File Reference
+
+| File | Responsibility |
+|------|---------------|
+| `src/memory/hybrid.ts` | `buildFtsQuery`, `bm25RankToScore`, `mergeHybridResults` — core pipeline |
+| `src/memory/mmr.ts` | `tokenize`, `jaccardSimilarity`, `mmrRerank`, `applyMMRToHybridResults` |
+| `src/memory/temporal-decay.ts` | `applyTemporalDecayToHybridResults`, evergreen detection, UTC date parsing |
+| `src/memory/query-expansion.ts` | Multi-language stop words, CJK/Korean tokenization, `expandQueryForFts`, LLM expander |
+| `src/memory/manager-search.ts` | `searchVector` (sqlite-vec + JS fallback), `searchKeyword` (FTS5 BM25) |
+| `src/memory/search-manager.ts` | `FallbackMemoryManager`, QMD cache management, backend selection |
+| `src/memory/types.ts` | `MemorySearchManager` interface, `MemoryProviderStatus`, `MemorySearchResult` |
+| `src/memory/backend-config.ts` | QMD config resolution, collection layout, scope defaults, search mode |
+| `src/memory/sqlite-vec.ts` | `loadSqliteVecExtension` — loads sqlite-vec or returns error for soft fallback |
+| `src/memory/hybrid.test.ts` | Tests for FTS query builder, BM25 score monotonicity, merge union semantics |
